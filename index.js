@@ -2,6 +2,10 @@ import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from 'mongodb';
 import "dotenv/config";
+import Stripe from "stripe";
+
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
@@ -37,12 +41,15 @@ const applications = database.collection("applications");
 
 const savedJobs = database.collection("savedJobs");
 
+const payments = database.collection("payments");
+
 
 app.get("/", (req, res) => {
   res.send("HireLoop Server is running");
 });
 
 
+// users related API's
 app.get("/users", async (req, res) => {
   const cursor = users.find({});
   const result = await cursor.toArray();
@@ -50,11 +57,51 @@ app.get("/users", async (req, res) => {
 })
 
 
+app.get("/users/:id/premium", async (req, res) => {
+  const id = req.params.id;
+  const query = { _id: new ObjectId(id) };
+  const result = await users.findOne(query, { projection: { premium: 1 } });
+  res.send({ result });
+})
+
+
+app.patch("/users/:id/role", async (req, res) => {
+  const id = req.params.id;
+  const { role } = req.body;
+
+  // Only these three roles are allowed.
+  if (!["seeker", "recruiter", "admin"].includes(role)) {
+    return res.status(400).send({ message: "Invalid role." });
+  }
+
+  const query = { _id: new ObjectId(id) };
+  const updateDoc = {
+    $set: { role },
+  };
+  const result = await users.updateOne(query, updateDoc);
+  res.send(result);
+});
+
+
 // jobs related API's
 // jobs send into database
 app.post("/jobs", async (req, res) => {
   const job = req.body;
   const result = await jobs.insertOne(job);
+  res.send(result);
+})
+
+
+// Update a job post (recruiter edit)
+app.put("/jobs/:id", async (req, res) => {
+  const id = req.params.id;
+  const update = { ...req.body };
+  delete update._id;
+
+  const result = await jobs.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: update }
+  );
   res.send(result);
 })
 
@@ -78,6 +125,11 @@ app.get("/jobs", async (req, res) => {
     query.category = req.query.category;
   }
 
+  // Filter by recruiter (owner) — each recruiter sees only their own posts
+  if (req.query.recruiterId) {
+    query.recruiterId = req.query.recruiterId;
+  }
+
   // Search by title, responsibilities, and qualifications
   if (req.query.search) {
     const searchText = req.query.search;
@@ -97,6 +149,19 @@ app.get("/jobs", async (req, res) => {
 
   res.send(result);
 });
+
+
+// Count a recruiter's job posts — used for the free-plan (5 posts) limit
+app.get("/jobs/count", async (req, res) => {
+  const query = {};
+
+  if (req.query.recruiterId) {
+    query.recruiterId = req.query.recruiterId;
+  }
+
+  const count = await jobs.countDocuments(query);
+  res.send({ count });
+})
 
 
 // Get a single job by id
@@ -124,17 +189,44 @@ app.delete("/jobs/:id", async (req, res) => {
   res.send(result);
 })
 
+
+// app.patch("/jobs/:id", async (req, res) => {
+//   const id = req.params.id;
+//   const updatedJob = req.body;
+  
+//   const query = { _id: new ObjectId(id) };
+//   const updateDoc = {
+//     $set: updatedJob,
+//   };
+
+//   const result = await jobs.updateOne(query, updateDoc);
+//   res.send(result);
+// })
+
+
 // application related API
 app.get("/applications", async (req, res) => {
+  const query = {};
+
+  if (req.query.jobId) {
+    query.jobId = req.query.jobId;
+  }
+
+  const cursor = applications.find(query);
+  const result = await cursor.toArray();
+  res.send(result);
+});
+
+
+app.get("/applications/count", async (req, res) => {
   const query = {};
 
   if (req.query.applicantId) {
     query.userId = req.query.applicantId;
   }
 
-  const cursor = applications.find(query);
-  const result = await cursor.toArray();
-  res.send(result);
+ const result = await applications.countDocuments(query);
+  res.send({count: result});
 });
 
 app.post("/applications", async (req, res) => {
@@ -226,6 +318,78 @@ app.delete("/saved-jobs", async (req, res) => {
   const result = await savedJobs.deleteOne({ userId, jobId });
   res.send(result);
 });
+
+
+
+// payments related API
+app.post("/payments/checkout-verify", async (req, res) => {
+  const { sessionId } = req.body;
+
+  if (!sessionId) {
+    return res.status(400).send({ message: "sessionId is required." });
+  }
+
+
+  const {
+    status,
+    payment_status,
+    customer_email,
+    metadata,
+    payment_intent,
+  } = await stripe.checkout.sessions.retrieve(sessionId);
+
+  //1. is it new session or never used
+
+  // 2. is the session id for the currently logged in user
+
+  // 3. insert session id into the payment collection
+
+  // 4. update user information as premium user
+
+  if (status === "complete" && payment_status === "paid") {
+
+    const sessionQuery = {sessionId}
+
+    const existingPayment = await payments.findOne(sessionQuery);
+
+    if (existingPayment) {
+      return res.send({ success: false, message: "Payment already verified" });
+    }
+
+    const payment = {
+      sessionId,
+      status,
+      payment_status,
+      customer_email,
+      userId: metadata?.userId ?? null,
+      payment_date: new Date(),
+      payment_intent,
+    }
+
+    const result = await payments.insertOne(payment);
+
+    // update the user table
+    let updateResult = null;
+    if (metadata?.userId) {
+      const query = { _id: new ObjectId(metadata.userId) };
+
+      const updatedDoc = {
+        $set: {
+          premium: true,
+        }
+      }
+
+      updateResult = await users.updateOne(
+        query, updatedDoc);
+    }
+
+    res.send({ success: true, result, updateResult, message: "Payment successful and user upgraded to premium" });
+
+    return;
+  }
+
+  return res.send({ success: false, message: "Payment not successful" });
+})
 
 
 app.listen(PORT, () => {
