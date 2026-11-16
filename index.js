@@ -18,6 +18,12 @@ app.use(cors());
 
 const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-onjifew-shard-00-00.qrw9kll.mongodb.net:27017,ac-onjifew-shard-00-01.qrw9kll.mongodb.net:27017,ac-onjifew-shard-00-02.qrw9kll.mongodb.net:27017/?ssl=true&replicaSet=atlas-11745k-shard-0&authSource=admin`);
 
+
+const myLogger = (req, res, next) => {
+  console.log("Now Hitting API",req.url,req.headers,req.body);
+  next();
+}
+
 export async function connectToMongoDB() {
     try {
         await client.connect();
@@ -35,6 +41,8 @@ const database = connectedClient.db("hireloopdb");
 
 const users = database.collection("user");
 
+const sessions = database.collection("session");
+
 const jobs = database.collection("jobs");
 
 const applications = database.collection("applications");
@@ -49,8 +57,64 @@ app.get("/", (req, res) => {
 });
 
 
+const verifyToken = async (req, res, next) => {
+   const authHeader = req.headers.authorization;
+   if (!authHeader) {
+     return res.status(401).send({ message: "Unauthorized" });
+     
+   }
+   const token = authHeader.split(" ")[1];
+
+   if (!token) {
+      return res.status(401).send({ message: "Unauthorized" });
+   }
+
+   const query = { token };
+   const session = await sessions.findOne(query);
+   if (!session) {
+      return res.status(401).send({ message: "Unauthorized" });
+   }
+
+   const userId = session.userId;
+   const userQuery = { _id: new ObjectId(userId) };
+   const user = await users.findOne(userQuery);
+
+   if (!user) {
+      return res.status(401).send({ message: "Unauthorized" });
+   }
+
+    req.user = user;
+
+   next();
+
+}
+
+// must call this middleware after verify Token
+const verifySeeker = (req, res, next) => {
+   if (req.user.role !== "seeker") {
+      return res.status(403).send({ message: "Forbidden: You are not a job seeker." });
+   }
+   next();
+}
+
+const verifyRecruiter = (req, res, next) => {
+   if (req.user.role !== "recruiter") {
+      return res.status(403).send({ message: "Forbidden: You are not a recruiter." });
+   }
+    next();
+  }
+
+
+const verifyAdmin = (req, res, next) => {
+   if (req.user.role !== "admin") {
+      return res.status(403).send({ message: "Forbidden: You are not an admin." });
+   }  
+   next();
+}
+
+
 // users related API's
-app.get("/users", async (req, res) => {
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   const cursor = users.find({});
   const result = await cursor.toArray();
   res.send(result);
@@ -65,7 +129,7 @@ app.get("/users/:id/premium", async (req, res) => {
 })
 
 
-app.patch("/users/:id/role", async (req, res) => {
+app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   const id = req.params.id;
   const { role } = req.body;
 
@@ -85,7 +149,7 @@ app.patch("/users/:id/role", async (req, res) => {
 
 // jobs related API's
 // jobs send into database
-app.post("/jobs", async (req, res) => {
+app.post("/jobs", verifyToken, verifyRecruiter, async (req, res) => {
   const job = req.body;
   const result = await jobs.insertOne(job);
   res.send(result);
@@ -205,11 +269,27 @@ app.delete("/jobs/:id", async (req, res) => {
 
 
 // application related API
-app.get("/applications", async (req, res) => {
+app.get("/applications", verifyToken, async (req, res) => {
+
+  console.log("Query parameters:", req.headers);
+
   const query = {};
 
   if (req.query.jobId) {
+
+    const jobQuery = { _id: new ObjectId(req.query.jobId) };
+    const job = await jobs.findOne(jobQuery);
+
+    if (job.recruiterId !== req.user._id.toString() && req.user.role !== "admin") {
+      res.status(403).send({ message: "Forbidden: You are not the recruiter for this job." });
+      return;
+    }
+
     query.jobId = req.query.jobId;
+  } else {
+    // No jobId → this is a "my applications" request. Force the session
+    // user's id — never trust the client-sent applicantId.
+    query.userId = req.user._id.toString();
   }
 
   const cursor = applications.find(query);
@@ -229,7 +309,7 @@ app.get("/applications/count", async (req, res) => {
   res.send({count: result});
 });
 
-app.post("/applications", async (req, res) => {
+app.post("/applications", verifyToken, verifySeeker, async (req, res) => {
   const application = req.body;
 
   if (!application?.jobId || !application?.userId) {
@@ -336,6 +416,7 @@ app.post("/payments/checkout-verify", async (req, res) => {
     customer_email,
     metadata,
     payment_intent,
+    amount_total,
   } = await stripe.checkout.sessions.retrieve(sessionId);
 
   //1. is it new session or never used
@@ -362,6 +443,10 @@ app.post("/payments/checkout-verify", async (req, res) => {
       payment_status,
       customer_email,
       userId: metadata?.userId ?? null,
+      // amount is in cents (Stripe amount_total); plan comes from the
+      // checkout metadata so the admin dashboard can show it later.
+      amount: amount_total ?? null,
+      plan: metadata?.plan ?? null,
       payment_date: new Date(),
       payment_intent,
     }
@@ -391,6 +476,87 @@ app.post("/payments/checkout-verify", async (req, res) => {
   return res.send({ success: false, message: "Payment not successful" });
 })
 
+
+// Admin dashboard APIs (admins only)
+app.get("/admin/stats", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden: Admins only." });
+  }
+
+  const totalUsers = await users.countDocuments({});
+  const totalRecruiters = await users.countDocuments({ role: "recruiter" });
+  const totalJobs = await jobs.countDocuments({});
+
+  // Companies are derived from job posts (no companies collection yet):
+  // count distinct companyId, plus distinct company names on posts that
+  // have no companyId.
+  const companyIds = await jobs.distinct("companyId", {
+    companyId: { $nin: [null, ""] },
+  });
+  const fallbackNames = await jobs.distinct("company", {
+    companyId: { $in: [null, ""] },
+    company: { $nin: [null, ""] },
+  });
+  const totalCompanies = companyIds.length + fallbackNames.length;
+
+  // Revenue = sum of stored amounts (in cents) for paid payments.
+  // Older payments recorded before `amount` was stored contribute 0.
+  const revenueRows = await payments
+    .aggregate([
+      { $match: { payment_status: "paid" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ])
+    .toArray();
+
+  res.send({
+    totalUsers,
+    totalRecruiters,
+    totalCompanies,
+    totalJobs,
+    totalRevenue: revenueRows[0]?.total ?? 0,
+  });
+});
+
+app.get("/payments", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden: Admins only." });
+  }
+
+  const rows = await payments
+    .find({})
+    .sort({ payment_date: -1 })
+    .limit(10)
+    .toArray();
+
+  // Attach the buyer's name from the user collection when possible.
+  const withUsers = await Promise.all(
+    rows.map(async (payment) => {
+      let userName = null;
+      if (payment.userId) {
+        try {
+          const user = await users.findOne({
+            _id: new ObjectId(payment.userId),
+          });
+          userName = user?.name ?? null;
+        } catch {
+          // invalid/legacy id — just leave the name empty
+        }
+      }
+
+      return {
+        sessionId: payment.sessionId,
+        customer_email: payment.customer_email,
+        userName,
+        plan: payment.plan ?? null,
+        amount: payment.amount ?? null, // cents; null for old records
+        payment_date: payment.payment_date,
+        payment_status: payment.payment_status,
+      };
+    })
+  );
+
+  res.send(withUsers);
+});
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
